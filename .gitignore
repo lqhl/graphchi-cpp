@@ -20,6 +20,9 @@ conf/graphchi.cnf.local
 
 bin
 
+# ctag file
+tags
+
 # XCode related (from http://stackoverflow.com/questions/49478/git-ignore-file-for-xcode-projects)
 
 #########################
