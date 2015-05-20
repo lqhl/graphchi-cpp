@@ -429,6 +429,9 @@ namespace graphchi {
                 // Do not allow self-edges
                 return;
             }  
+#ifdef REVERSE_GRAPH
+            std::swap(from, to);
+#endif
             edge_with_value<EdgeDataType> e(from, to, val);
 #ifdef DYNAMICEDATA
             e.is_chivec_value = input_value;

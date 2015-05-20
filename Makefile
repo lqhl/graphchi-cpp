@@ -1,6 +1,7 @@
 INCFLAGS = -I/usr/local/include/ -I./src/
 
 CPP = g++
+MPICPP = mpic++
 CPPFLAGS = -g -O3 $(INCFLAGS)  -fopenmp -Wall -Wno-strict-aliasing 
 LINKERFLAGS = -lz
 DEBUGFLAGS = -g -ggdb $(INCFLAGS)
@@ -36,6 +37,10 @@ example_apps/% : example_apps/%.cpp $(HEADERS)
 myapps/% : myapps/%.cpp $(HEADERS)
 	@mkdir -p bin/$(@D)
 	$(CPP) $(CPPFLAGS) -Imyapps/ $@.cpp -o bin/$@ $(LINKERFLAGS)
+
+mpi-apps/% : mpi-apps/%.cpp $(HEADERS)
+	@mkdir -p bin/$(@D)
+	$(MPICPP) $(CPPFLAGS) -Imyapps/ $@.cpp -o bin/$@ $(LINKERFLAGS) -lmpi
 
 tests/%: src/tests/%.cpp $(HEADERS)
 	@mkdir -p bin/$(@D)
