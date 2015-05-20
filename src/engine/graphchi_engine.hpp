@@ -66,6 +66,7 @@ namespace graphchi {
     public:     
         typedef sliding_shard<VertexDataType, EdgeDataType, svertex_t> slidingshard_t;
         typedef memory_shard<VertexDataType, EdgeDataType, svertex_t> memshard_t;
+        typedef GraphChiProgram<VertexDataType, EdgeDataType> prog_t;
         
     protected:
         std::string base_filename;
@@ -392,6 +393,45 @@ namespace graphchi {
             /* Wait for all reads to complete */
             iomgr->wait_for_reads();
         }
+
+        virtual void exec_updates(std::vector<prog_t*> &userprogramPool, std::vector<svertex_t> &vertices) {
+            metrics_entry me = m.start_time();
+            size_t nvertices = vertices.size();
+            if (!enable_deterministic_parallelism) {
+                for(int i=0; i < (int)nvertices; i++) vertices[i].parallel_safe = true;
+            }
+            int sub_interval_len = sub_interval_en - sub_interval_st;
+
+            std::vector<vid_t> random_order(randomization ? sub_interval_len + 1 : 0);
+            if (randomization) {
+                // Randomize vertex-vector
+                for(int idx=0; idx <= (int)sub_interval_len; idx++) random_order[idx] = idx;
+                std::random_shuffle(random_order.begin(), random_order.end());
+            }
+             
+            int progNum = userprogramPool.size();
+            bool repeat_updates = false;
+            do {
+                omp_set_num_threads(exec_threads);
+
+#pragma omp parallel for schedule(dynamic)
+                for (int i = 0; i < progNum; i++) {
+                    for (int idx=0; idx <= (int)sub_interval_len; idx++) {
+                        vid_t vid = sub_interval_st + (randomization ? random_order[idx] : idx);
+                        svertex_t & v = vertices[vid - sub_interval_st];
+                        if (!disable_vertexdata_storage)
+                            v.dataptr = vertex_data_handler->vertex_data_ptr(vid);
+                        if (v.scheduled)
+                            userprogramPool[i]->update(v, chicontext);
+                    }
+                }
+
+                for (int i = 0; i < progNum; i++)
+                    repeat_updates |= userprogramPool[i]->repeat_updates(chicontext);
+            } while (repeat_updates);
+            
+            m.stop_time(me, "execute-updates");
+        }
         
         virtual void exec_updates(GraphChiProgram<VertexDataType, EdgeDataType, svertex_t> &userprogram,
                           std::vector<svertex_t> &vertices) {
@@ -453,6 +493,83 @@ namespace graphchi {
             m.stop_time(me, "execute-updates");
         }
         
+
+        virtual void exec_updates_inmemory_mode(std::vector<prog_t*> &userprogramPool, std::vector<svertex_t> &vertices) {
+            omp_set_num_threads(exec_threads);
+            int progNum = userprogramPool.size();
+            work = nupdates = 0;
+            
+            for(iter=0; iter<niters; iter++) {
+                logstream(LOG_INFO) << "In-memory mode: Iteration " << iter << " starts. (" << chicontext.runtime() << " secs)" << std::endl;
+                chicontext.iteration = iter;
+                if (iter > 0) { // First one run before -- ugly
+#pragma omp parallel for schedule(dynamic)
+                    for (int i = 0; i < progNum; i++)
+                        userprogramPool[i]->before_iteration(iter, chicontext);
+                }
+#pragma omp parallel for schedule(dynamic)
+                for (int i = 0; i < progNum; i++)
+                    userprogramPool[i]->before_exec_interval(0, (int)num_vertices(), chicontext);
+                
+                if (use_selective_scheduling) {
+                    if (iter > 0 && !scheduler->has_new_tasks) {
+                        logstream(LOG_INFO) << "No new tasks to run!" << std::endl;
+                        niters = iter;
+                        break;
+                    }
+                    scheduler->new_iteration(iter);
+                    
+                    bool newtasks = false;
+                    for(int i=0; i < (int)vertices.size(); i++) { // Could, should parallelize
+                        if (iter == 0 || scheduler->is_scheduled(i)) {
+                            vertices[i].scheduled =  true;
+                            newtasks = true;
+                            nupdates++;
+                            work += vertices[i].inc + vertices[i].outc;
+                        } else {
+                            vertices[i].scheduled = false;
+                        }
+                    }
+                    if (!newtasks) {
+                        // Finished
+                        niters = iter;
+                        break;
+
+                    }
+                    scheduler->has_new_tasks = false; // Kind of misleading since scheduler may still have tasks - but no new tasks.
+                } else {
+                    nupdates += num_vertices();
+                    if (!only_adjacency) {
+                        work += num_edges();
+                    }
+                }
+                
+                m.start_time("inmem-exec");
+                
+                exec_updates(userprogramPool, vertices);
+                
+                m.stop_time("inmem-exec");
+                
+                load_after_updates(vertices);
+                
+#pragma omp parallel for schedule(dynamic)
+                for (int i = 0; i < progNum; i++)
+                    userprogramPool[i]->after_exec_interval(0, (int)num_vertices(), chicontext);
+#pragma omp parallel for schedule(dynamic)
+                for (int i = 0; i < progNum; i++)
+                    userprogramPool[i]->after_iteration(iter, chicontext);
+                if (chicontext.last_iteration > 0 && chicontext.last_iteration <= iter){
+                   logstream(LOG_INFO)<<"Stopping engine since last iteration was set to: " << chicontext.last_iteration << std::endl;
+                   break;
+                }
+
+            }
+            
+            if (save_edgesfiles_after_inmemmode) {
+                logstream(LOG_INFO) << "Saving memory shard..." << std::endl;
+                
+            }
+        }
 
         /**
          Special method for running all iterations with the same vertex-vector.
@@ -710,6 +827,294 @@ namespace graphchi {
 #endif
         }
         
+        void run(std::vector<prog_t*> &userprogramPool, int _niters) {
+            m.start_time("runtime");
+            if (degree_handler == NULL)
+                degree_handler = create_degree_handler();
+            iomgr->set_cache_budget(get_option_long("cachesize_mb", 0) * 1024L * 1024L);
+
+            m.set("cachesize_mb", get_option_int("cachesize_mb", 0));
+            m.set("membudget_mb", get_option_int("membudget_mb", 0));
+
+            randomization = get_option_int("randomization", 0) == 1;
+            
+            if (svertex_t().computational_edges()) {
+                // Heuristic
+                set_maxwindow(membudget_mb * 1024 * 1024 / 3 / 100);
+                logstream(LOG_INFO) << "Set maxwindow:" << maxwindow << std::endl;
+            }
+            
+            if (randomization) {
+                timeval tt;
+                gettimeofday(&tt, NULL);
+                uint32_t seed = (uint32_t) get_option_int("seed", (int)tt.tv_usec);
+                std::cout << "SEED: " << seed << std::endl;
+                srand(seed);
+            }
+            
+            niters = _niters;
+            logstream(LOG_INFO) << "GraphChi starting" << std::endl;
+            logstream(LOG_INFO) << "Licensed under the Apache License 2.0" << std::endl;
+            logstream(LOG_INFO) << "Copyright Aapo Kyrola et al., Carnegie Mellon University (2012)" << std::endl;
+            
+            if (vertex_data_handler == NULL && !disable_vertexdata_storage)
+                vertex_data_handler = new vertex_data_store<VertexDataType>(base_filename, num_vertices(), iomgr);
+        
+            initialize_before_run();
+            
+            
+            /* Setup */
+            if (sliding_shards.size() == 0) {
+                initialize_sliding_shards();
+                if (initialize_edges_before_run) {
+                    for(int j=0; j<(int)sliding_shards.size(); j++) sliding_shards[j]->initdata();
+                }
+            } else {
+                logstream(LOG_DEBUG) << "Engine being restarted, do not reinitialize." << std::endl;
+            }
+                
+            initialize_scheduler();
+            omp_set_nested(1);
+            
+            /* Install a 'mock'-scheduler to chicontext if scheduler
+             is not used. */
+            chicontext.scheduler = scheduler;
+            if (scheduler == NULL) {
+                chicontext.scheduler = new non_scheduler();
+            }
+            
+            /* Print configuration */
+            print_config();
+            
+            int progNum = userprogramPool.size();
+            
+            /* Main loop */
+            for(iter=0; iter < niters; iter++) {
+                logstream(LOG_INFO) << "Start iteration: " << iter << std::endl;
+                
+                initialize_iter();
+                
+                /* Check vertex data file has the right size (number of vertices may change) */
+                if (!disable_vertexdata_storage)
+                    vertex_data_handler->check_size(num_vertices());
+                
+                /* Keep the context object updated */
+                chicontext.filename = base_filename;
+                chicontext.iteration = iter;
+                chicontext.num_iterations = niters;
+                chicontext.nvertices = num_vertices();
+                if (!only_adjacency) chicontext.nedges = num_edges();
+                
+                chicontext.execthreads = exec_threads;
+                chicontext.reset_deltas(exec_threads);
+                
+                /* Call iteration-begin event handler */
+#pragma omp parallel for schedule(dynamic)
+                for (int i = 0; i < progNum; i++)
+                    userprogramPool[i]->before_iteration(iter, chicontext);
+                
+                /* Check scheduler. If no scheduled tasks, terminate. */
+                if (use_selective_scheduling) {
+                    if (scheduler != NULL) {
+                        if (!scheduler->has_new_tasks) {
+                            logstream(LOG_INFO) << "No new tasks to run!" << std::endl;
+                            break;
+                        }
+                        scheduler->has_new_tasks = false; // Kind of misleading since scheduler may still have tasks - but no new tasks.
+                    }
+                }
+                
+                /* Now clear scheduler bits for the interval */
+                if (scheduler != NULL)
+                    scheduler->new_iteration(iter);
+                
+                
+                std::vector<int> intshuffle(nshards);
+                
+                if (randomization) {
+                    for(int i=0; i<nshards; i++) intshuffle[i] = i;
+                    std::random_shuffle(intshuffle.begin(), intshuffle.end());
+                }
+                
+                /* Interval loop */
+                for(int interval_idx=0; interval_idx < nshards; ++interval_idx) {
+                    exec_interval = interval_idx;
+                    
+                    if (randomization && iter > 0) { // NOTE: only randomize shard order after first iteration so we can compute indices
+                        exec_interval = intshuffle[interval_idx];
+                        // Hack to make system work if we jump backwards
+                       // if (interval_idx > 0 && last_exec_interval> exec_interval) {
+                            for(int p=0; p<nshards; p++) {
+                                sliding_shards[p]->flush();
+                                sliding_shards[p]->set_offset(0, 0, 0);
+                            }
+                      //  }
+                    }
+                    
+                    /* Determine interval limits */
+                    vid_t interval_st = get_interval_start(exec_interval);
+                    vid_t interval_en = get_interval_end(exec_interval);
+                    
+                    if (interval_st > interval_en) continue; // Can happen on very very small graphs.
+
+                    if (!is_inmemory_mode()) {
+#pragma omp parallel for schedule(dynamic)
+                        for (int i = 0; i < progNum; i++)
+                            userprogramPool[i]->before_exec_interval(interval_st, interval_en, chicontext);
+                    }
+
+                    /* Flush stream shard for the exec interval */
+                    sliding_shards[exec_interval]->flush();
+                    iomgr->wait_for_writes(); // Actually we would need to only wait for         writes of given shard. TODO.
+                    
+                    /* Initialize memory shard */
+                    if (memoryshard != NULL) delete memoryshard;
+                    memoryshard = create_memshard(interval_st, interval_en);
+                    memoryshard->only_adjacency = only_adjacency;
+                    memoryshard->set_disable_async_writes(randomization);
+                    
+                    sub_interval_st = interval_st;
+                    logstream(LOG_INFO) << chicontext.runtime() << "s: Starting: " 
+                    << sub_interval_st << " -- " << interval_en << std::endl;
+                    
+                    while (sub_interval_st <= interval_en) {
+                        
+                        modification_lock.lock();
+                        /* Determine the sub interval */
+                        sub_interval_en = determine_next_window(exec_interval,
+                                                                sub_interval_st, 
+                                                                std::min(interval_en, (is_inmemory_mode() ? interval_en : sub_interval_st + maxwindow)), 
+                                                                size_t(membudget_mb) * 1024 * 1024);
+                        assert(sub_interval_en >= sub_interval_st);
+                        
+                        logstream(LOG_INFO) << "Iteration " << iter << "/" << (niters - 1) << ", subinterval: " << sub_interval_st << " - " << sub_interval_en << std::endl;
+                                                
+                        bool any_vertex_scheduled = is_any_vertex_scheduled(sub_interval_st, sub_interval_en);
+                        if (!any_vertex_scheduled) {
+                            logstream(LOG_INFO) << "No vertices scheduled, skip." << std::endl;
+                            sub_interval_st = sub_interval_en + 1;
+                            modification_lock.unlock();
+                            continue;
+                        }
+                        
+                        /* Initialize vertices */
+                        int nvertices = sub_interval_en - sub_interval_st + 1;
+                        graphchi_edge<EdgeDataType> * edata = NULL;
+                        
+                        std::vector<svertex_t> vertices(nvertices, svertex_t());
+                        logstream(LOG_DEBUG) << "Allocation " << nvertices << " vertices, sizeof:" << sizeof(svertex_t)
+                        << " total:" << nvertices * sizeof(svertex_t) << std::endl;
+                        init_vertices(vertices, edata);
+                        
+                        /* Load data */
+                        load_before_updates(vertices);                        
+                        
+                        modification_lock.unlock();
+                        
+                        logstream(LOG_INFO) << "Start updates" << std::endl;
+                        /* Execute updates */
+                        if (!is_inmemory_mode()) {
+                            exec_updates(userprogramPool, vertices);
+                            /* Load phase after updates (used by the functional engine) */
+                            load_after_updates(vertices);
+                        } else {
+
+                            exec_updates_inmemory_mode(userprogramPool, vertices);
+                        }
+                        logstream(LOG_INFO) << "Finished updates" << std::endl;
+                        
+                        
+                        /* Save vertices */
+                        if (!disable_vertexdata_storage) {
+                            save_vertices(vertices);
+                        }
+                        sub_interval_st = sub_interval_en + 1;
+                        
+                        /* Delete edge buffer. TODO: reuse. */
+                        if (edata != NULL) {
+                            delete edata;
+                            edata = NULL;
+                        }
+                       
+                    } // while subintervals
+
+                    if (memoryshard->loaded() && (save_edgesfiles_after_inmemmode || !is_inmemory_mode())) {
+                        memoryshard->commit(modifies_inedges, modifies_outedges & !disable_outedges);
+                        
+                        if (!randomization) {
+                            sliding_shards[exec_interval]->set_offset(memoryshard->offset_for_stream_cont(), memoryshard->offset_vid_for_stream_cont(),
+                                                                  memoryshard->edata_ptr_for_stream_cont());
+                        }
+                        delete memoryshard;
+                        memoryshard = NULL;
+                    }     
+                    if (!is_inmemory_mode()) {
+#pragma omp parallel for schedule(dynamic)
+                        for (int i = 0; i < progNum; i++)
+                            userprogramPool[i]->after_exec_interval(interval_st, interval_en, chicontext);
+                    }
+
+                } // For exec_interval
+                
+                if (!is_inmemory_mode()) {  // Run sepately
+#pragma omp parallel for schedule(dynamic)
+                        for (int i = 0; i < progNum; i++)
+                            userprogramPool[i]->after_iteration(iter, chicontext);
+                }
+                
+                /* Move the sliding shard of the current interval to correct position and flush
+                 writes of all shards for next iteration. */
+                for(int p=0; p<nshards; p++) {
+                    sliding_shards[p]->flush();
+                    sliding_shards[p]->set_offset(0, 0, 0);
+                }
+                iomgr->wait_for_writes();
+                
+                /* Write progress log */
+                write_delta_log();
+                
+                /* Check if user has defined a last iteration */
+                if (chicontext.last_iteration >= 0) {
+                    niters = chicontext.last_iteration + 1;
+                    logstream(LOG_DEBUG) << "Last iteration is now: " << (niters-1) << std::endl;
+                }
+                iteration_finished();
+                iomgr->first_pass_finished(); // Tell IO-manager that we have passed over the graph (used for optimization)
+            } // Iterations
+            
+            m.stop_time("runtime");
+            
+            m.set("updates", nupdates);
+            m.set("work", work);
+            m.set("nvertices", num_vertices());
+            m.set("execthreads", (size_t)exec_threads);
+            m.set("loadthreads", (size_t)load_threads);
+#ifndef GRAPHCHI_DISABLE_COMPRESSION
+            m.set("compression", 1);
+#else
+            m.set("compression", 0);
+#endif
+            
+            m.set("scheduler", (size_t)use_selective_scheduling);
+            m.set("niters", niters);
+            
+            // Close outputs
+            for(int i=0; i< (int)outputs.size(); i++) {
+                outputs[i]->close();
+            }   
+            outputs.clear();
+            
+            // Commit vertex data
+            if (vertex_data_handler != NULL) {
+                delete vertex_data_handler;
+                vertex_data_handler = NULL;
+            }
+            
+            if (modifies_inedges || modifies_outedges) {
+                iomgr->commit_cached_blocks();
+            }
+        }
+
         /**
          * Run GraphChi program, specified as a template 
          * parameter. 
