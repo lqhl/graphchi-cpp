@@ -410,12 +410,11 @@ namespace graphchi {
             }
              
             int progNum = userprogramPool.size();
-            bool repeat_updates = false;
-            do {
-                omp_set_num_threads(exec_threads);
+            omp_set_num_threads(exec_threads);
 
 #pragma omp parallel for schedule(dynamic)
-                for (int i = 0; i < progNum; i++) {
+            for (int i = 0; i < progNum; i++) {
+                do {
                     for (int idx=0; idx <= (int)sub_interval_len; idx++) {
                         vid_t vid = sub_interval_st + (randomization ? random_order[idx] : idx);
                         svertex_t & v = vertices[vid - sub_interval_st];
@@ -424,15 +423,12 @@ namespace graphchi {
                         if (v.scheduled)
                             userprogramPool[i]->update(v, chicontext);
                     }
-                }
+                } while (userprogramPool[i]->repeat_updates(chicontext));
+            }
 
-                for (int i = 0; i < progNum; i++)
-                    repeat_updates |= userprogramPool[i]->repeat_updates(chicontext);
-            } while (repeat_updates);
-            
             m.stop_time(me, "execute-updates");
         }
-        
+
         virtual void exec_updates(GraphChiProgram<VertexDataType, EdgeDataType, svertex_t> &userprogram,
                           std::vector<svertex_t> &vertices) {
             metrics_entry me = m.start_time();
