@@ -66,7 +66,7 @@ namespace graphchi {
     public:     
         typedef sliding_shard<VertexDataType, EdgeDataType, svertex_t> slidingshard_t;
         typedef memory_shard<VertexDataType, EdgeDataType, svertex_t> memshard_t;
-        typedef GraphChiProgram<VertexDataType, EdgeDataType> prog_t;
+        typedef GraphChiProgram<VertexDataType, EdgeDataType, svertex_t> prog_t;
         
     protected:
         std::string base_filename;
